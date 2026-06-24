@@ -290,7 +290,7 @@ class Course:
         return False
 
     def print_info(self):
-        print(f"[Course] CRN: {self.crn} | {self.title} | Dept: {self.department} | {self.days} {self.time} | {self.semester} {self.year} | {self.credits} credits")
+        print(f"[Course] CRN: {self.crn} | {self.title} | Dept: {self.department} | {self.days} {self.time} | {self.semester} {self.year} | {self.credits} credits | Capacity: {self.capacity}")
 
 
 # HELPER FUNCTIONS
@@ -318,7 +318,7 @@ def row_to_course(row):
     c = Course()
     c.set_crn(row[0]); c.set_title(row[1]); c.set_department(row[2])
     c.set_time(row[3]); c.set_days(row[4]); c.set_semester(row[5])
-    c.set_year(row[6]); c.set_credits(row[7])
+    c.set_year(row[6]); c.set_credits(row[7]); c.set_capacity(row[8])
     return c
 
 
@@ -368,9 +368,34 @@ def setup(cursor, database):
         DAYS TEXT NOT NULL,
         SEMESTER TEXT NOT NULL,
         YEAR INTEGER NOT NULL,
-        CREDITS INTEGER NOT NULL
+        CREDITS INTEGER NOT NULL,
+        CAPACITY INTEGER
     )"""
     cursor.execute(sql_command)
+
+    # "CREATE TABLE IF NOT EXISTS" only uses the column list above the very
+    # first time COURSE is ever created. If COURSE already existed in the
+    # database file from before we added CAPACITY, the line above does
+    # nothing - SQLite sees the table is already there and skips it. So we
+    # double check here: does COURSE already have a CAPACITY column? PRAGMA
+    # table_info gives us back the list of every column currently in the
+    # table, and we look for "CAPACITY" in that list.
+    cursor.execute("PRAGMA table_info(COURSE)")
+    existing_columns = [column[1] for column in cursor.fetchall()]
+    if "CAPACITY" not in existing_columns:
+        cursor.execute("ALTER TABLE COURSE ADD COLUMN CAPACITY INTEGER")
+
+    # Create LOGIN table if it doesn't already exist.
+    # USER_ID matches the ID column in STUDENT, INSTRUCTOR, or ADMIN -
+    # whichever table that person belongs to.
+    # The CHECK constraint tells SQLite to refuse any row where ROLE isn't
+    # exactly "student", "instructor", or "admin" - it's a safety net that
+    # catches typos before bad data ever gets saved.
+    cursor.execute("""CREATE TABLE IF NOT EXISTS LOGIN (
+        USER_ID INTEGER PRIMARY KEY NOT NULL,
+        PASSWORD TEXT NOT NULL,
+        ROLE TEXT NOT NULL CHECK (ROLE IN ('student', 'instructor', 'admin'))
+    )""")
 
     # Add 2 students - wrapped in try/except in case they already exist
     try:
@@ -394,17 +419,216 @@ def setup(cursor, database):
 
     # Insert 5 courses - wrapped in try/except in case they already exist
     try:
-        cursor.execute("INSERT INTO COURSE VALUES (40001, 'Applied Programming Concepts', 'BSCO', '9:00AM', 'MWF', 'Fall', 2026, 3)")
-        cursor.execute("INSERT INTO COURSE VALUES (40002, 'Circuits I', 'BSEE', '11:00AM', 'TTH', 'Fall', 2026, 4)")
-        cursor.execute("INSERT INTO COURSE VALUES (40003, 'Statics', 'BSME', '1:00PM', 'MWF', 'Fall', 2026, 3)")
-        cursor.execute("INSERT INTO COURSE VALUES (40004, 'Calculus III', 'BSAS', '10:00AM', 'TTH', 'Fall', 2026, 4)")
-        cursor.execute("INSERT INTO COURSE VALUES (40005, 'Data Structures', 'BCOS', '2:00PM', 'MWF', 'Fall', 2026, 3)")
+        cursor.execute("INSERT INTO COURSE VALUES (40001, 'Applied Programming Concepts', 'BSCO', '9:00AM', 'MWF', 'Fall', 2026, 3, 30)")
+        cursor.execute("INSERT INTO COURSE VALUES (40002, 'Circuits I', 'BSEE', '11:00AM', 'TTH', 'Fall', 2026, 4, 28)")
+        cursor.execute("INSERT INTO COURSE VALUES (40003, 'Statics', 'BSME', '1:00PM', 'MWF', 'Fall', 2026, 3, 30)")
+        cursor.execute("INSERT INTO COURSE VALUES (40004, 'Calculus III', 'BSAS', '10:00AM', 'TTH', 'Fall', 2026, 4, 35)")
+        cursor.execute("INSERT INTO COURSE VALUES (40005, 'Data Structures', 'BCOS', '2:00PM', 'MWF', 'Fall', 2026, 3, 30)")
     except sqlite3.IntegrityError:
         pass
 
     # Save all setup changes to the database file
     database.commit()
     print("Database ready.\n")
+
+
+# Assignment 5 additions - realistic sample data and login system
+
+# SEED USERS AND COURSES
+# Loads a realistic set of students, instructors, courses, and admins into
+# the database. Several students share the same MAJOR and several courses
+# share the same DEPT on purpose, so functions like match_courses() (and any
+# future roster/conflict-checking code) have real overlapping data to use.
+# This is safe to call every time the program starts: each insert is wrapped
+# in try/except, so if a row with that ID/CRN is already there from a
+# previous run, we just skip it instead of crashing.
+
+def seed_users_and_courses(cursor, database):
+
+    students = [
+        (11001, "Olivia", "Martinez", 2026, "BSCO", "omartinez@university.edu"),
+        (11002, "Liam", "Chen", 2027, "BSEE", "lchen@university.edu"),
+        (11003, "Emma", "Johnson", 2026, "BSCO", "ejohnson@university.edu"),
+        (11004, "Noah", "Williams", 2028, "BSME", "nwilliams@university.edu"),
+        (11005, "Ava", "Thompson", 2027, "BSAS", "athompson@university.edu"),
+        (11006, "Ethan", "Davis", 2026, "BSCO", "edavis@university.edu"),
+        (11007, "Sophia", "Patel", 2029, "BSCE", "spatel@university.edu"),
+        (11008, "Mason", "Rodriguez", 2027, "BSEE", "mrodriguez@university.edu"),
+        (11009, "Isabella", "Kim", 2026, "BSCO", "ikim@university.edu"),
+        (11010, "Lucas", "Nguyen", 2028, "BSME", "lnguyen@university.edu"),
+        (11011, "Mia", "Anderson", 2027, "BSAS", "manderson@university.edu"),
+        (11012, "Benjamin", "Carter", 2026, "BSCO", "bcarter@university.edu"),
+        (11013, "Charlotte", "Wright", 2029, "BSCE", "cwright@university.edu"),
+        (11014, "Henry", "Lopez", 2027, "BSEE", "hlopez@university.edu"),
+        (11015, "Amelia", "Scott", 2026, "BSCO", "ascott@university.edu"),
+        (11016, "Jacob", "Murphy", 2028, "BSME", "jmurphy@university.edu"),
+        (11017, "Harper", "Collins", 2027, "BSAS", "hcollins@university.edu"),
+        (11018, "Daniel", "Mitchell", 2026, "BSCO", "dmitchell@university.edu"),
+        (11019, "Grace", "Bennett", 2029, "BSCE", "gbennett@university.edu"),
+        (11020, "Samuel", "Reed", 2027, "BSEE", "sreed@university.edu"),
+    ]
+
+    instructors = [
+        (21001, "Robert", "Hayes", "Professor", 2005, "BSCO", "rhayes@university.edu"),
+        (21002, "Linda", "Foster", "Associate Professor", 2010, "BSEE", "lfoster@university.edu"),
+        (21003, "James", "Coleman", "Professor", 1998, "BSME", "jcoleman@university.edu"),
+        (21004, "Susan", "Brooks", "Assistant Professor", 2015, "BSAS", "sbrooks@university.edu"),
+        (21005, "Michael", "Turner", "Professor", 2008, "BSCO", "mturner@university.edu"),
+        (21006, "Karen", "Hughes", "Associate Professor", 2012, "BSCE", "khughes@university.edu"),
+        (21007, "David", "Powell", "Professor", 2001, "BSEE", "dpowell@university.edu"),
+        (21008, "Nancy", "Ortiz", "Assistant Professor", 2018, "BSCO", "nortiz@university.edu"),
+        (21009, "William", "Bishop", "Professor", 2003, "BSME", "wbishop@university.edu"),
+        (21010, "Patricia", "Long", "Associate Professor", 2011, "BSAS", "plong@university.edu"),
+        (21011, "Christopher", "Reyes", "Professor", 2006, "BSCE", "creyes@university.edu"),
+        (21012, "Barbara", "Simmons", "Assistant Professor", 2019, "BSEE", "bsimmons@university.edu"),
+        (21013, "Joseph", "Fisher", "Professor", 2000, "BSCO", "jfisher@university.edu"),
+        (21014, "Margaret", "Wells", "Associate Professor", 2014, "BSME", "mwells@university.edu"),
+        (21015, "Thomas", "Hart", "Professor", 2009, "BSAS", "thart@university.edu"),
+    ]
+
+    courses = [
+        (41001, "Intro to Programming", "BSCO", "9:00AM", "MWF", "Fall", 2026, 3, 35),
+        (41002, "Data Structures II", "BSCO", "11:00AM", "MWF", "Fall", 2026, 3, 30),
+        (41003, "Database Systems", "BSCO", "1:00PM", "TTH", "Fall", 2026, 3, 28),
+        (41004, "Operating Systems", "BSCO", "10:00AM", "TTH", "Spring", 2027, 4, 25),
+        (41005, "Circuits II", "BSEE", "9:00AM", "TTH", "Fall", 2026, 4, 30),
+        (41006, "Digital Logic Design", "BSEE", "2:00PM", "MWF", "Fall", 2026, 3, 32),
+        (41007, "Signals and Systems", "BSEE", "11:00AM", "TTH", "Spring", 2027, 4, 27),
+        (41008, "Thermodynamics", "BSME", "1:00PM", "MWF", "Fall", 2026, 3, 30),
+        (41009, "Fluid Mechanics", "BSME", "9:00AM", "TTH", "Fall", 2026, 4, 28),
+        (41010, "Machine Design", "BSME", "3:00PM", "MWF", "Spring", 2027, 3, 25),
+        (41011, "Calculus III", "BSAS", "10:00AM", "TTH", "Fall", 2026, 4, 40),
+        (41012, "Linear Algebra", "BSAS", "9:00AM", "MWF", "Fall", 2026, 3, 35),
+        (41013, "Differential Equations", "BSAS", "1:00PM", "TTH", "Spring", 2027, 4, 30),
+        (41014, "Structural Analysis", "BSCE", "11:00AM", "MWF", "Fall", 2026, 3, 28),
+        (41015, "Soil Mechanics", "BSCE", "2:00PM", "TTH", "Fall", 2026, 3, 26),
+        (41016, "Surveying", "BSCE", "10:00AM", "MWF", "Spring", 2027, 3, 24),
+        (41017, "Algorithms", "BSCO", "3:00PM", "TTH", "Spring", 2027, 3, 30),
+        (41018, "Computer Networks", "BSCO", "12:00PM", "MWF", "Fall", 2026, 3, 32),
+        (41019, "Power Systems", "BSEE", "1:00PM", "TTH", "Fall", 2026, 4, 28),
+        (41020, "Environmental Engineering", "BSCE", "9:00AM", "MWF", "Spring", 2027, 3, 26),
+    ]
+
+    admins = [
+        (31001, "Patricia", "Nolan", "Registrar", "Admin Building 101", "pnolan@university.edu"),
+        (31002, "George", "Whitfield", "Dean of Students", "Admin Building 205", "gwhitfield@university.edu"),
+        (31003, "Rachel", "Dunn", "IT Director", "Tech Building 12", "rdunn@university.edu"),
+    ]
+
+    # Go through every row and try to insert it. The "?" placeholders are
+    # filled in safely by sqlite3 - this is the same pattern the insert()
+    # function below uses, so typed-in values (or in this case, our own
+    # data) can never be misread as SQL commands.
+    for s in students:
+        try:
+            cursor.execute("INSERT INTO STUDENT VALUES (?, ?, ?, ?, ?, ?)", s)
+        except sqlite3.IntegrityError:
+            pass  # this student ID is already in the table
+
+    for i in instructors:
+        try:
+            cursor.execute("INSERT INTO INSTRUCTOR VALUES (?, ?, ?, ?, ?, ?, ?)", i)
+        except sqlite3.IntegrityError:
+            pass
+
+    for c in courses:
+        try:
+            cursor.execute("INSERT INTO COURSE VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", c)
+        except sqlite3.IntegrityError:
+            pass
+
+    for a in admins:
+        try:
+            cursor.execute("INSERT INTO ADMIN VALUES (?, ?, ?, ?, ?, ?)", a)
+        except sqlite3.IntegrityError:
+            pass
+
+    database.commit()
+    print("Realistic sample data loaded (or already present).\n")
+
+
+# SEED LOGIN TABLE
+# Builds one LOGIN row for every person already sitting in STUDENT,
+# INSTRUCTOR, or ADMIN. The password is just whatever comes before the "@"
+# in that person's email - so "omartinez@university.edu" gets the password
+# "omartinez". We read the email back out of the database (instead of
+# retyping it here) so the LOGIN table can never drift out of sync with
+# the real email addresses stored elsewhere.
+
+def seed_login_table(cursor, database):
+
+    role_tables = [
+        ("STUDENT", "student"),
+        ("INSTRUCTOR", "instructor"),
+        ("ADMIN", "admin"),
+    ]
+
+    for table_name, role in role_tables:
+        cursor.execute(f"SELECT ID, EMAIL FROM {table_name}")
+        for user_id, email in cursor.fetchall():
+            password = email.split("@")[0]
+            try:
+                cursor.execute("INSERT INTO LOGIN VALUES (?, ?, ?)", (user_id, password, role))
+            except sqlite3.IntegrityError:
+                pass  # this person already has a LOGIN row
+
+    database.commit()
+    print("Login accounts ready.\n")
+
+
+# LOGIN / LOGOUT
+# login() only ever asks for an email and a password - never a role. We
+# figure out the role ourselves by checking which table (STUDENT,
+# INSTRUCTOR, or ADMIN) the email actually belongs to, then confirming the
+# password against the LOGIN table.
+
+def login(cursor):
+    max_attempts = 3
+
+    for attempt in range(max_attempts):
+        email = input("Email: ").strip()
+        password = input("Password: ").strip()
+
+        user_id = None
+        role = None
+
+        # Check STUDENT, then INSTRUCTOR, then ADMIN for a matching email,
+        # and stop as soon as we find one - an email should only ever
+        # belong to one person in one of these three tables.
+        for table_name in ("STUDENT", "INSTRUCTOR", "ADMIN"):
+            cursor.execute(f"SELECT ID FROM {table_name} WHERE EMAIL = ?", (email,))
+            row = cursor.fetchone()
+            if row:
+                user_id = row[0]
+                break
+
+        # Now that we (maybe) know who this is, check the LOGIN table for
+        # that exact USER_ID + PASSWORD combination. ROLE is read straight
+        # from that matching row, since LOGIN is the single source of
+        # truth for "who is allowed to log in, and as what."
+        if user_id is not None:
+            cursor.execute("SELECT ROLE FROM LOGIN WHERE USER_ID = ? AND PASSWORD = ?", (user_id, password))
+            login_row = cursor.fetchone()
+            if login_row:
+                role = login_row[0]
+
+        if role is not None:
+            print(f"Welcome! You are logged in as {role}.")
+            return role, user_id
+
+        attempts_left = max_attempts - (attempt + 1)
+        if attempts_left > 0:
+            print(f"Invalid email or password. {attempts_left} attempt(s) left.")
+        else:
+            print("Too many failed login attempts. Exiting program.")
+
+    # We used up every attempt without a match, so we return "nobody" -
+    # (None, None) - and let main() decide to stop the program.
+    return None, None
+
+
+def logout():
+    print("You have been logged out. Goodbye!")
 
 
 # Dillon - menu and query functions
@@ -507,8 +731,9 @@ def insert(cursor, database):
         sem = input("Semester: ").strip()
         year = input("Year: ").strip()
         credits = input("Credits: ").strip()
+        capacity = input("Capacity: ").strip()
         try:
-            cursor.execute("INSERT INTO COURSE VALUES (?, ?, ?, ?, ?, ?, ?, ?)", (crn, title, dept, time, days, sem, year, credits))
+            cursor.execute("INSERT INTO COURSE VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", (crn, title, dept, time, days, sem, year, credits, capacity))
             database.commit()
             print("Course added.")
         except sqlite3.IntegrityError:
@@ -610,6 +835,16 @@ def main():
     cursor = database.cursor()
 
     setup(cursor, database)
+    seed_users_and_courses(cursor, database)
+    seed_login_table(cursor, database)
+
+    # Require a successful login before showing the menu at all. If login()
+    # ran out of attempts, it returns (None, None) - in that case we close
+    # the database connection and stop the program right here.
+    role, user_id = login(cursor)
+    if role is None:
+        database.close()
+        return
 
     while True:
         print("University Scheduling System")
@@ -636,6 +871,7 @@ def main():
         elif choice == "6":
             match_courses(cursor)
         elif choice == "0":
+            logout()
             print("Exiting.")
             break
         else:
