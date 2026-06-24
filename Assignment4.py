@@ -67,12 +67,14 @@ class Student(User):
     def search_courses_by_parameter(self, parameter):
         print(f"Student searching courses with parameter: {parameter}")
 
-    def add_course(self, course_id):
-        if course_id in self.schedule:
-            print(f"Course {course_id} is already in your schedule.")
+    def add_course(self, course):
+        if course.crn in self.schedule:
+            print(f"Course {course.crn} is already in your schedule.")
+        elif course.enroll(self.user_id):
+            self.schedule.append(course.crn)
+            print(f"Course {course.crn} added to schedule.")
         else:
-            self.schedule.append(course_id)
-            print(f"Course {course_id} added to schedule.")
+            print(f"Course {course.crn} is full.")
 
     def drop_course(self, course_id):
         if course_id in self.schedule:
@@ -201,9 +203,9 @@ class Admin(User):
         else:
             print(f"User {user_id} not found in the system.")
 
-    def add_student_to_course(self, student, course_id):
-        student.add_course(course_id)
-        print(f"Admin linked student {student.user_id} to course {course_id}.")
+    def add_student_to_course(self, student, course):
+        student.add_course(course)
+        print(f"Admin linked student {student.user_id} to course {course.crn}.")
 
     def remove_student_from_course(self, student, course_id):
         student.drop_course(course_id)
@@ -247,6 +249,8 @@ class Course:
         self.semester = ""
         self.year = 0
         self.credits = 0
+        self.capacity = 0
+        self.enrolled = []
 
     def set_crn(self, crn):
         self.crn = crn
@@ -271,6 +275,24 @@ class Course:
 
     def set_credits(self, credits):
         self.credits = credits
+
+    def set_capacity(self, capacity):
+        self.capacity = capacity
+
+    def is_full(self):
+        return len(self.enrolled) >= self.capacity
+
+    def enroll(self, student_id):
+        if not self.is_full() and student_id not in self.enrolled:
+            self.enrolled.append(student_id)
+            return True
+        return False
+
+    def drop(self, student_id):
+        if student_id in self.enrolled:
+            self.enrolled.remove(student_id)
+            return True
+        return False
 
     def print_info(self):
         print(f"[Course] CRN: {self.crn} | {self.title} | Dept: {self.department} | {self.days} {self.time} | {self.semester} {self.year} | {self.credits} credits")
