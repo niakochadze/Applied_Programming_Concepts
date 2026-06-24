@@ -45,7 +45,6 @@ class Student(User):
         self.grad_year = 0
         self.major = ""
         self.email = ""
-        self.schedule = []
 
     def set_grad_year(self, year):
         self.grad_year = year
@@ -56,41 +55,167 @@ class Student(User):
     def set_email(self, email):
         self.email = email
 
-    def search_courses(self):
-        print("Student course search function called.")
+    def search_courses(self, cursor):
+        # Query the COURSE table directly for Fall 2026 offerings, sorted for readability.
+        cursor.execute(
+            "SELECT * FROM COURSE WHERE SEMESTER = 'Fall' AND YEAR = 2026 ORDER BY DEPT, TIME"
+        )
+        rows = cursor.fetchall()
+        print("\n--- All Courses (Fall 2026) ---")
+        if not rows:
+            print("  No courses found.")
+            return
+        for row in rows:
+            row_to_course(row).print_info()
 
-    def search_courses_by_parameter(self, parameter):
-        print(f"Student searching courses with parameter: {parameter}")
+    def search_courses_by_parameter(self, cursor, parameter, value):
+        # Whitelist valid column names so that no user-supplied string can be
+        # interpolated into the query as raw SQL — prevents injection entirely.
+        allowed_columns = {"CRN", "TITLE", "DEPT", "TIME", "DAYS",
+                           "SEMESTER", "YEAR", "CREDITS"}
+        col = parameter.strip().upper()
+        if col not in allowed_columns:
+            print(f"  Cannot search by '{parameter}'. "
+                  f"Allowed columns: {', '.join(sorted(allowed_columns))}")
+            return
 
-    def add_course(self, course):
-        if course.crn in self.schedule:
-            print(f"Course {course.crn} is already in your schedule.")
-        elif course.enroll(self.user_id):
-            self.schedule.append(course.crn)
-            print(f"Course {course.crn} added to schedule.")
+        # TITLE uses LIKE so a partial keyword (e.g. 'Calc') matches all Calculus courses.
+        # All other columns use exact equality.
+        if col == "TITLE":
+            cursor.execute("SELECT * FROM COURSE WHERE TITLE LIKE ?", (f"%{value}%",))
         else:
-            print(f"Course {course.crn} is full.")
+            cursor.execute(f"SELECT * FROM COURSE WHERE {col} = ?", (value,))
 
-    def drop_course(self, course_id):
-        if course_id in self.schedule:
-            self.schedule.remove(course_id)
-            print(f"Course {course_id} removed from schedule.")
+        rows = cursor.fetchall()
+        print(f"\n--- Courses where {col} = '{value}' ---")
+        if not rows:
+            print("  No matching courses found.")
+            return
+        for row in rows:
+            row_to_course(row).print_info()
+
+    def add_course(self, cursor, crn):
+        # Step 1: confirm the course exists and retrieve its title and seat limit.
+        cursor.execute("SELECT TITLE, CAPACITY FROM COURSE WHERE CRN = ?", (crn,))
+        row = cursor.fetchone()
+        if not row:
+            print(f"  No course found with CRN {crn}.")
+            return
+        title, capacity = row
+
+        # Step 2: prevent double-enrollment by checking ENROLLMENT for this student+CRN pair.
+        cursor.execute(
+            "SELECT 1 FROM ENROLLMENT WHERE STUDENT_ID = ? AND CRN = ?",
+            (self.user_id, crn)
+        )
+        if cursor.fetchone():
+            print(f"  You are already enrolled in {title} (CRN {crn}).")
+            return
+
+        # Step 3: enforce the seat cap — count existing enrollments and compare to CAPACITY.
+        cursor.execute("SELECT COUNT(*) FROM ENROLLMENT WHERE CRN = ?", (crn,))
+        enrolled = cursor.fetchone()[0]
+        if enrolled >= capacity:
+            print(f"  {title} (CRN {crn}) is full ({enrolled}/{capacity} seats taken).")
+            return
+
+        # Step 4: all checks passed — insert the enrollment row and commit to the database.
+        cursor.execute(
+            "INSERT INTO ENROLLMENT (STUDENT_ID, CRN) VALUES (?, ?)",
+            (self.user_id, crn)
+        )
+        cursor.connection.commit()
+        print(f"  Enrolled in {title} (CRN {crn}). "
+              f"Seats remaining: {capacity - enrolled - 1}")
+
+    def drop_course(self, cursor, crn):
+        # Verify this student is actually enrolled before attempting a delete.
+        cursor.execute(
+            "SELECT 1 FROM ENROLLMENT WHERE STUDENT_ID = ? AND CRN = ?",
+            (self.user_id, crn)
+        )
+        if not cursor.fetchone():
+            print(f"  You are not enrolled in CRN {crn}.")
+            return
+
+        # Fetch the course title so the confirmation message is human-readable.
+        cursor.execute("SELECT TITLE FROM COURSE WHERE CRN = ?", (crn,))
+        title_row = cursor.fetchone()
+        title = title_row[0] if title_row else f"CRN {crn}"
+
+        # Remove the enrollment row and persist the change.
+        cursor.execute(
+            "DELETE FROM ENROLLMENT WHERE STUDENT_ID = ? AND CRN = ?",
+            (self.user_id, crn)
+        )
+        cursor.connection.commit()
+        print(f"  Dropped {title} (CRN {crn}) from your schedule.")
+
+    def check_conflicts(self, cursor):
+        # Fetch every course this student is enrolled in, with the fields needed for comparison.
+        cursor.execute("""
+            SELECT C.CRN, C.TITLE, C.DAYS, C.TIME
+            FROM ENROLLMENT E
+            JOIN COURSE C ON E.CRN = C.CRN
+            WHERE E.STUDENT_ID = ?
+        """, (self.user_id,))
+        courses = cursor.fetchall()
+
+        if not courses:
+            print("  Your schedule is empty — no conflicts possible.")
+            return
+
+        def days_to_set(days_str):
+            # "TTH" is stored as a single token, not individual characters, so it must be
+            # handled before the character-split path to avoid {"T","H"} vs {"TU","TH"} mismatch.
+            if days_str.upper() == "TTH":
+                return {"TU", "TH"}              # Tuesday and Thursday as two-char tokens
+            return {c.upper() for c in days_str}  # "MWF" -> {"M", "W", "F"}
+
+        # Compare every distinct pair of courses: a conflict is a shared meeting day
+        # AND the same start time (the scheduling system uses 1-hour fixed slots).
+        conflicts = []
+        for i in range(len(courses)):
+            for j in range(i + 1, len(courses)):
+                crn_a, title_a, days_a, time_a = courses[i]
+                crn_b, title_b, days_b, time_b = courses[j]
+                shared_days = days_to_set(days_a) & days_to_set(days_b)
+                if shared_days and time_a == time_b:
+                    conflicts.append(
+                        (title_a, crn_a, title_b, crn_b, time_a,
+                         "/".join(sorted(shared_days)))
+                    )
+
+        if conflicts:
+            print("\n*** SCHEDULE CONFLICTS DETECTED ***")
+            for title_a, crn_a, title_b, crn_b, time, days in conflicts:
+                print(f"  Conflict: {title_a} (CRN {crn_a}) and {title_b} (CRN {crn_b}) "
+                      f"both meet at {time} on {days}")
         else:
-            print(f"Course {course_id} not found in your schedule.")
+            print("  No conflicts found in your schedule.")
 
-    def check_conflicts(self):
-        if len(self.schedule) != len(set(self.schedule)):
-            print("Conflict detected in schedule.")
-        else:
-            print("No conflicts found in schedule.")
-
-    def print_schedule(self):
-        print("Student Schedule:")
-        if len(self.schedule) == 0:
+    def print_schedule(self, cursor):
+        print(f"\n--- Schedule for {self.first_name} {self.last_name} (ID: {self.user_id}) ---")
+        # Join ENROLLMENT with COURSE to get full course details for every enrolled CRN.
+        # ORDER BY DAYS then TIME so the output reads like a weekly calendar.
+        cursor.execute("""
+            SELECT C.CRN, C.TITLE, C.DEPT, C.TIME, C.DAYS,
+                   C.SEMESTER, C.YEAR, C.CREDITS, C.CAPACITY
+            FROM ENROLLMENT E
+            JOIN COURSE C ON E.CRN = C.CRN
+            WHERE E.STUDENT_ID = ?
+            ORDER BY C.DAYS, C.TIME
+        """, (self.user_id,))
+        rows = cursor.fetchall()
+        if not rows:
             print("  No courses enrolled.")
-        else:
-            for course_id in self.schedule:
-                print(f"  Course ID: {course_id}")
+            return
+        total_credits = 0
+        for row in rows:
+            c = row_to_course(row)
+            c.print_info()
+            total_credits += c.credits
+        print(f"\n  Total Credits: {total_credits}")
 
     def print_info(self):
         print(f"[Student] ID: {self.user_id} | {self.first_name} {self.last_name} | Major: {self.major} | Grad: {self.grad_year} | Email: {self.email}")
@@ -395,6 +520,17 @@ def setup(cursor, database):
         USER_ID INTEGER PRIMARY KEY NOT NULL,
         PASSWORD TEXT NOT NULL,
         ROLE TEXT NOT NULL CHECK (ROLE IN ('student', 'instructor', 'admin'))
+    )""")
+
+    # ENROLLMENT tracks which student is registered in which course (many-to-many).
+    # IF NOT EXISTS means this is safe to call on every startup, and also safe if
+    # another team member already created the table in a previous run.
+    cursor.execute("""CREATE TABLE IF NOT EXISTS ENROLLMENT (
+        STUDENT_ID INTEGER NOT NULL,
+        CRN        INTEGER NOT NULL,
+        PRIMARY KEY (STUDENT_ID, CRN),
+        FOREIGN KEY (STUDENT_ID) REFERENCES STUDENT(ID),
+        FOREIGN KEY (CRN)        REFERENCES COURSE(CRN)
     )""")
 
     # Add 2 students - wrapped in try/except in case they already exist
@@ -880,4 +1016,5 @@ def main():
     database.close()
 
 
-main()
+if __name__ == "__main__":
+    main()
