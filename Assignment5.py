@@ -229,8 +229,7 @@ class Instructor(User):
         self.hire_year = 0
         self.department = ""
         self.email = ""
-        self.courses = []
-        self.roster = []
+        # No in-memory course/roster lists — all data lives in the database now.
 
     def set_title(self, title):
         self.title = title
@@ -244,33 +243,95 @@ class Instructor(User):
     def set_email(self, email):
         self.email = email
 
-    def search_courses(self):
-        print("Instructor course search function called.")
+    def search_courses(self, cursor):
+        # Show every course in the system, sorted the same way as the Student view
+        # so both roles see a consistent listing.
+        cursor.execute(
+            "SELECT * FROM COURSE WHERE SEMESTER = 'Fall' AND YEAR = 2026 ORDER BY DEPT, TIME"
+        )
+        rows = cursor.fetchall()
+        print("\n--- All Courses (Fall 2026) ---")
+        if not rows:
+            print("  No courses found.")
+            return
+        for row in rows:
+            row_to_course(row).print_info()
 
-    def search_courses_by_parameter(self, parameter):
-        print(f"Instructor searching courses with parameter: {parameter}")
-
-    def print_schedule(self):
-        print("Instructor Teaching Schedule:")
-        if len(self.courses) == 0:
-            print("  No courses assigned.")
+    def search_courses_by_parameter(self, cursor, parameter, value):
+        # Same injection-safe whitelist pattern used in Student — only known column
+        # names are ever interpolated into the query string.
+        allowed_columns = {"CRN", "TITLE", "DEPT", "TIME", "DAYS",
+                           "SEMESTER", "YEAR", "CREDITS"}
+        col = parameter.strip().upper()
+        if col not in allowed_columns:
+            print(f"  Cannot search by '{parameter}'. "
+                  f"Allowed columns: {', '.join(sorted(allowed_columns))}")
+            return
+        if col == "TITLE":
+            cursor.execute("SELECT * FROM COURSE WHERE TITLE LIKE ?", (f"%{value}%",))
         else:
-            for course_id in self.courses:
-                print(f"  Course ID: {course_id}")
+            cursor.execute(f"SELECT * FROM COURSE WHERE {col} = ?", (value,))
+        rows = cursor.fetchall()
+        print(f"\n--- Courses where {col} = '{value}' ---")
+        if not rows:
+            print("  No matching courses found.")
+            return
+        for row in rows:
+            row_to_course(row).print_info()
 
-    def print_class_list(self):
-        print("Instructor Class List:")
-        if len(self.roster) == 0:
-            print("  No students in roster.")
-        else:
-            for student_id in self.roster:
-                print(f"  Student ID: {student_id}")
+    def print_schedule(self, cursor):
+        print(f"\n--- Teaching Schedule for {self.first_name} {self.last_name} (ID: {self.user_id}) ---")
+        # SELECT C.* pulls every column from COURSE — if new columns are added to
+        # COURSE later, this query picks them up automatically without code changes.
+        cursor.execute("""
+            SELECT C.*
+            FROM INSTRUCTOR_COURSE IC
+            JOIN COURSE C ON IC.CRN = C.CRN
+            WHERE IC.INSTRUCTOR_ID = ?
+            ORDER BY C.DAYS, C.TIME
+        """, (self.user_id,))
+        rows = cursor.fetchall()
+        if not rows:
+            print("  No courses assigned to your account yet.")
+            return
+        for row in rows:
+            row_to_course(row).print_info()
 
-    def search_roster(self, student_id):
-        if student_id in self.roster:
-            print(f"Student {student_id} found in roster.")
+    def print_class_list(self, cursor, crn):
+        # Look up the course title first so the header is human-readable.
+        cursor.execute("SELECT TITLE FROM COURSE WHERE CRN = ?", (crn,))
+        title_row = cursor.fetchone()
+        title = title_row[0] if title_row else f"CRN {crn}"
+        print(f"\n--- Class List: {title} (CRN {crn}) ---")
+        # Join ENROLLMENT with STUDENT to get full student details for each enrolled seat.
+        cursor.execute("""
+            SELECT S.*
+            FROM ENROLLMENT E
+            JOIN STUDENT S ON E.STUDENT_ID = S.ID
+            WHERE E.CRN = ?
+            ORDER BY S.SURNAME, S.NAME
+        """, (crn,))
+        rows = cursor.fetchall()
+        if not rows:
+            print("  No students enrolled.")
+            return
+        for row in rows:
+            row_to_student(row).print_info()
+
+    def search_roster(self, cursor, crn, student_id):
+        # A simple point-lookup: is this student_id present in ENROLLMENT for this CRN?
+        cursor.execute(
+            "SELECT 1 FROM ENROLLMENT WHERE CRN = ? AND STUDENT_ID = ?",
+            (crn, student_id)
+        )
+        if cursor.fetchone():
+            # Fetch the name to make the confirmation message more useful.
+            cursor.execute("SELECT NAME, SURNAME FROM STUDENT WHERE ID = ?", (student_id,))
+            name_row = cursor.fetchone()
+            name = f"{name_row[0]} {name_row[1]}" if name_row else f"ID {student_id}"
+            print(f"  {name} (ID {student_id}) IS enrolled in CRN {crn}.")
         else:
-            print(f"Student {student_id} not found in roster.")
+            print(f"  Student ID {student_id} is NOT enrolled in CRN {crn}.")
 
     def print_info(self):
         print(f"[Instructor] ID: {self.user_id} | {self.first_name} {self.last_name} | {self.title} | Dept: {self.department} | Hired: {self.hire_year} | Email: {self.email}")
@@ -283,8 +344,7 @@ class Admin(User):
         self.title = ""
         self.office = ""
         self.email = ""
-        self.course_list = []
-        self.user_list = []
+        # No in-memory lists — all course and user data lives in the database now.
 
     def set_title(self, title):
         self.title = title
@@ -295,64 +355,196 @@ class Admin(User):
     def set_email(self, email):
         self.email = email
 
-    def add_course(self, course_id):
-        if course_id in self.course_list:
-            print(f"Course {course_id} already exists in the system.")
-        else:
-            self.course_list.append(course_id)
-            print(f"Course {course_id} added to the system.")
+    def add_course(self, cursor, course_data):
+        # course_data must be a 9-tuple matching the COURSE column order:
+        # (CRN, TITLE, DEPT, TIME, DAYS, SEMESTER, YEAR, CREDITS, CAPACITY)
+        try:
+            cursor.execute(
+                "INSERT INTO COURSE VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", course_data
+            )
+            cursor.connection.commit()
+            print(f"  Course '{course_data[1]}' (CRN {course_data[0]}) added to the system.")
+        except sqlite3.IntegrityError:
+            print(f"  CRN {course_data[0]} already exists — no changes made.")
 
-    def remove_course(self, course_id):
-        if course_id in self.course_list:
-            self.course_list.remove(course_id)
-            print(f"Course {course_id} removed from the system.")
-        else:
-            print(f"Course {course_id} not found in the system.")
+    def remove_course(self, cursor, crn):
+        # Confirm the course exists before deleting so we can print its name.
+        cursor.execute("SELECT TITLE FROM COURSE WHERE CRN = ?", (crn,))
+        row = cursor.fetchone()
+        if not row:
+            print(f"  No course found with CRN {crn}.")
+            return
+        cursor.execute("DELETE FROM COURSE WHERE CRN = ?", (crn,))
+        cursor.connection.commit()
+        print(f"  Course '{row[0]}' (CRN {crn}) removed from the system.")
 
-    def add_user(self, user_id):
-        if user_id in self.user_list:
-            print(f"User {user_id} already exists in the system.")
-        else:
-            self.user_list.append(user_id)
-            print(f"User {user_id} added to the system.")
+    def add_user(self, cursor, role, user_data):
+        # role is 'student', 'instructor', or 'admin' — it controls which table
+        # receives the row and what column layout user_data must have:
+        #   student    → (id, first, last, grad_year, major, email)
+        #   instructor → (id, first, last, title, hire_year, dept, email)
+        #   admin      → (id, first, last, title, office, email)
+        role = role.lower()
+        try:
+            if role == "student":
+                cursor.execute("INSERT INTO STUDENT VALUES (?, ?, ?, ?, ?, ?)", user_data)
+            elif role == "instructor":
+                cursor.execute("INSERT INTO INSTRUCTOR VALUES (?, ?, ?, ?, ?, ?, ?)", user_data)
+            elif role == "admin":
+                cursor.execute("INSERT INTO ADMIN VALUES (?, ?, ?, ?, ?, ?)", user_data)
+            else:
+                print(f"  Unknown role '{role}'. Must be student, instructor, or admin.")
+                return
 
-    def remove_user(self, user_id):
-        if user_id in self.user_list:
-            self.user_list.remove(user_id)
-            print(f"User {user_id} removed from the system.")
-        else:
-            print(f"User {user_id} not found in the system.")
+            # Derive the initial password from the email (everything before the '@'),
+            # then insert a matching LOGIN row so the new person can actually sign in.
+            user_id = user_data[0]
+            email = user_data[-1]
+            password = email.split("@")[0]
+            cursor.execute(
+                "INSERT INTO LOGIN VALUES (?, ?, ?)", (user_id, password, role)
+            )
+            cursor.connection.commit()
+            print(f"  {role.capitalize()} ID {user_id} added. Login password: '{password}'.")
+        except sqlite3.IntegrityError:
+            print(f"  ID {user_data[0]} already exists — no changes made.")
 
-    def add_student_to_course(self, student, course):
-        student.add_course(course)
-        print(f"Admin linked student {student.user_id} to course {course.crn}.")
+    def remove_user(self, cursor, role, user_id):
+        # Map role strings to table names so we can target the right table dynamically.
+        role = role.lower()
+        table_map = {"student": "STUDENT", "instructor": "INSTRUCTOR", "admin": "ADMIN"}
+        if role not in table_map:
+            print(f"  Unknown role '{role}'. Must be student, instructor, or admin.")
+            return
+        table = table_map[role]
+        # Make sure the user actually exists before attempting the delete.
+        cursor.execute(f"SELECT ID FROM {table} WHERE ID = ?", (user_id,))
+        if not cursor.fetchone():
+            print(f"  No {role} found with ID {user_id}.")
+            return
+        # Delete from the role table first, then clean up their LOGIN entry.
+        cursor.execute(f"DELETE FROM {table} WHERE ID = ?", (user_id,))
+        cursor.execute("DELETE FROM LOGIN WHERE USER_ID = ?", (user_id,))
+        cursor.connection.commit()
+        print(f"  {role.capitalize()} ID {user_id} and their login have been removed.")
 
-    def remove_student_from_course(self, student, course_id):
-        student.drop_course(course_id)
-        print(f"Admin unlinked student {student.user_id} from course {course_id}.")
+    def add_student_to_course(self, cursor, student_id, crn):
+        # Validate that both the student and course exist before doing anything.
+        cursor.execute("SELECT 1 FROM STUDENT WHERE ID = ?", (student_id,))
+        if not cursor.fetchone():
+            print(f"  Student ID {student_id} not found.")
+            return
+        cursor.execute("SELECT TITLE, CAPACITY FROM COURSE WHERE CRN = ?", (crn,))
+        row = cursor.fetchone()
+        if not row:
+            print(f"  No course found with CRN {crn}.")
+            return
+        title, capacity = row
+        # Prevent double-enrollment.
+        cursor.execute(
+            "SELECT 1 FROM ENROLLMENT WHERE STUDENT_ID = ? AND CRN = ?", (student_id, crn)
+        )
+        if cursor.fetchone():
+            print(f"  Student {student_id} is already enrolled in {title} (CRN {crn}).")
+            return
+        # Respect the course seat cap.
+        cursor.execute("SELECT COUNT(*) FROM ENROLLMENT WHERE CRN = ?", (crn,))
+        enrolled = cursor.fetchone()[0]
+        if enrolled >= capacity:
+            print(f"  {title} (CRN {crn}) is full ({enrolled}/{capacity} seats taken).")
+            return
+        cursor.execute(
+            "INSERT INTO ENROLLMENT (STUDENT_ID, CRN) VALUES (?, ?)", (student_id, crn)
+        )
+        cursor.connection.commit()
+        print(f"  Student {student_id} enrolled in {title} (CRN {crn}).")
 
-    def add_instructor_to_course(self, instructor, course_id):
-        if course_id not in instructor.courses:
-            instructor.courses.append(course_id)
-            print(f"Admin linked instructor {instructor.user_id} to course {course_id}.")
-        else:
-            print(f"Instructor {instructor.user_id} is already linked to course {course_id}.")
+    def remove_student_from_course(self, cursor, student_id, crn):
+        # Confirm the enrollment row exists before deleting it.
+        cursor.execute(
+            "SELECT 1 FROM ENROLLMENT WHERE STUDENT_ID = ? AND CRN = ?", (student_id, crn)
+        )
+        if not cursor.fetchone():
+            print(f"  Student {student_id} is not enrolled in CRN {crn}.")
+            return
+        cursor.execute(
+            "DELETE FROM ENROLLMENT WHERE STUDENT_ID = ? AND CRN = ?", (student_id, crn)
+        )
+        cursor.connection.commit()
+        print(f"  Student {student_id} removed from CRN {crn}.")
 
-    def remove_instructor_from_course(self, instructor, course_id):
-        if course_id in instructor.courses:
-            instructor.courses.remove(course_id)
-            print(f"Admin unlinked instructor {instructor.user_id} from course {course_id}.")
-        else:
-            print(f"Instructor {instructor.user_id} is not linked to course {course_id}.")
+    def add_instructor_to_course(self, cursor, instructor_id, crn):
+        # Validate that both the instructor and course exist first.
+        cursor.execute("SELECT 1 FROM INSTRUCTOR WHERE ID = ?", (instructor_id,))
+        if not cursor.fetchone():
+            print(f"  Instructor ID {instructor_id} not found.")
+            return
+        cursor.execute("SELECT TITLE FROM COURSE WHERE CRN = ?", (crn,))
+        row = cursor.fetchone()
+        if not row:
+            print(f"  No course found with CRN {crn}.")
+            return
+        course_title = row[0]
+        # Prevent duplicate assignments.
+        cursor.execute(
+            "SELECT 1 FROM INSTRUCTOR_COURSE WHERE INSTRUCTOR_ID = ? AND CRN = ?",
+            (instructor_id, crn)
+        )
+        if cursor.fetchone():
+            print(f"  Instructor {instructor_id} is already assigned to {course_title} (CRN {crn}).")
+            return
+        cursor.execute(
+            "INSERT INTO INSTRUCTOR_COURSE (INSTRUCTOR_ID, CRN) VALUES (?, ?)",
+            (instructor_id, crn)
+        )
+        cursor.connection.commit()
+        print(f"  Instructor {instructor_id} assigned to {course_title} (CRN {crn}).")
 
-    def search_courses(self):
-        print("Admin course search function called.")
+    def remove_instructor_from_course(self, cursor, instructor_id, crn):
+        cursor.execute(
+            "SELECT 1 FROM INSTRUCTOR_COURSE WHERE INSTRUCTOR_ID = ? AND CRN = ?",
+            (instructor_id, crn)
+        )
+        if not cursor.fetchone():
+            print(f"  Instructor {instructor_id} is not assigned to CRN {crn}.")
+            return
+        cursor.execute(
+            "DELETE FROM INSTRUCTOR_COURSE WHERE INSTRUCTOR_ID = ? AND CRN = ?",
+            (instructor_id, crn)
+        )
+        cursor.connection.commit()
+        print(f"  Instructor {instructor_id} removed from CRN {crn}.")
 
-    def search_courses_by_parameter(self, parameter):
-        print(f"Admin searching courses with parameter: {parameter}")
+    def search_courses(self, cursor):
+        # Admin sees all courses regardless of semester, sorted for easy scanning.
+        cursor.execute("SELECT * FROM COURSE ORDER BY DEPT, YEAR, SEMESTER, TIME")
+        rows = cursor.fetchall()
+        print("\n--- All Courses ---")
+        if not rows:
+            print("  No courses found.")
+            return
+        for row in rows:
+            row_to_course(row).print_info()
 
-    def print_roster(self):
-        print("Admin print roster function called.")
+    def print_roster(self, cursor, crn):
+        # Same join pattern as Instructor.print_class_list — just a different entry point.
+        cursor.execute("SELECT TITLE FROM COURSE WHERE CRN = ?", (crn,))
+        title_row = cursor.fetchone()
+        title = title_row[0] if title_row else f"CRN {crn}"
+        print(f"\n--- Roster: {title} (CRN {crn}) ---")
+        cursor.execute("""
+            SELECT S.*
+            FROM ENROLLMENT E
+            JOIN STUDENT S ON E.STUDENT_ID = S.ID
+            WHERE E.CRN = ?
+            ORDER BY S.SURNAME, S.NAME
+        """, (crn,))
+        rows = cursor.fetchall()
+        if not rows:
+            print("  No students enrolled.")
+            return
+        for row in rows:
+            row_to_student(row).print_info()
 
     def print_info(self):
         print(f"[Admin] ID: {self.user_id} | {self.first_name} {self.last_name} | {self.title} | Office: {self.office} | Email: {self.email}")
@@ -531,6 +723,17 @@ def setup(cursor, database):
         PRIMARY KEY (STUDENT_ID, CRN),
         FOREIGN KEY (STUDENT_ID) REFERENCES STUDENT(ID),
         FOREIGN KEY (CRN)        REFERENCES COURSE(CRN)
+    )""")
+
+    # INSTRUCTOR_COURSE tracks which instructor is assigned to teach which course
+    # (also many-to-many — one course can have multiple instructors, one instructor
+    # can teach multiple courses). IF NOT EXISTS keeps this idempotent on every run.
+    cursor.execute("""CREATE TABLE IF NOT EXISTS INSTRUCTOR_COURSE (
+        INSTRUCTOR_ID INTEGER NOT NULL,
+        CRN           INTEGER NOT NULL,
+        PRIMARY KEY (INSTRUCTOR_ID, CRN),
+        FOREIGN KEY (INSTRUCTOR_ID) REFERENCES INSTRUCTOR(ID),
+        FOREIGN KEY (CRN)           REFERENCES COURSE(CRN)
     )""")
 
     # Add 2 students - wrapped in try/except in case they already exist
@@ -963,8 +1166,187 @@ def match_courses(cursor):
             print(f"  -> No matching instructor found for department: {course.department}")
 
 
+# ROLE-SPECIFIC MENUS
+# Each function below handles the interactive menu loop for one role.
+# They receive the already-constructed user object (Student, Instructor, or Admin)
+# and the database cursor, then loop until the user chooses to log out.
+
+def student_menu(student, cursor):
+    while True:
+        print(f"\n=== Student Menu — {student.first_name} {student.last_name} ===")
+        print("1. Browse all courses (Fall 2026)")
+        print("2. Search courses by parameter")
+        print("3. View my schedule")
+        print("4. Add a course to my schedule")
+        print("5. Drop a course from my schedule")
+        print("6. Check my schedule for conflicts")
+        print("0. Logout / Exit")
+
+        choice = input("\nChoice: ").strip()
+
+        if choice == "1":
+            student.search_courses(cursor)
+        elif choice == "2":
+            param = input("Search by (e.g. DEPT, TITLE, CREDITS): ").strip()
+            value = input("Value: ").strip()
+            student.search_courses_by_parameter(cursor, param, value)
+        elif choice == "3":
+            student.print_schedule(cursor)
+        elif choice == "4":
+            crn = input("CRN to add: ").strip()
+            student.add_course(cursor, int(crn))
+        elif choice == "5":
+            crn = input("CRN to drop: ").strip()
+            student.drop_course(cursor, int(crn))
+        elif choice == "6":
+            student.check_conflicts(cursor)
+        elif choice == "0":
+            logout()
+            break
+        else:
+            print("Invalid choice.")
+
+
+def instructor_menu(instructor, cursor):
+    while True:
+        print(f"\n=== Instructor Menu — {instructor.title} {instructor.first_name} {instructor.last_name} ===")
+        print("1. Browse all courses (Fall 2026)")
+        print("2. Search courses by parameter")
+        print("3. View my teaching schedule")
+        print("4. View class list for a course")
+        print("5. Search roster for a specific student")
+        print("0. Logout / Exit")
+
+        choice = input("\nChoice: ").strip()
+
+        if choice == "1":
+            instructor.search_courses(cursor)
+        elif choice == "2":
+            param = input("Search by (e.g. DEPT, TITLE, CREDITS): ").strip()
+            value = input("Value: ").strip()
+            instructor.search_courses_by_parameter(cursor, param, value)
+        elif choice == "3":
+            instructor.print_schedule(cursor)
+        elif choice == "4":
+            crn = input("CRN: ").strip()
+            instructor.print_class_list(cursor, int(crn))
+        elif choice == "5":
+            crn = input("CRN: ").strip()
+            sid = input("Student ID: ").strip()
+            instructor.search_roster(cursor, int(crn), int(sid))
+        elif choice == "0":
+            logout()
+            break
+        else:
+            print("Invalid choice.")
+
+
+def admin_menu(admin, cursor, database):
+    while True:
+        print(f"\n=== Admin Menu — {admin.title} {admin.first_name} {admin.last_name} ===")
+        print("--- Courses ---")
+        print(" 1. Browse all courses")
+        print(" 2. Add a course")
+        print(" 3. Remove a course")
+        print(" 4. Assign instructor to a course")
+        print(" 5. Remove instructor from a course")
+        print(" 6. Enroll student in a course")
+        print(" 7. Remove student from a course")
+        print(" 8. View roster for a course")
+        print("--- Users ---")
+        print(" 9. Add a user")
+        print("10. Remove a user")
+        print("--- System ---")
+        print("11. Print all records")
+        print("12. Search records")
+        print("13. Update a record")
+        print("14. Match courses to instructors")
+        print(" 0. Logout / Exit")
+
+        choice = input("\nChoice: ").strip()
+
+        if choice == "1":
+            admin.search_courses(cursor)
+        elif choice == "2":
+            # Collect each course field individually so input is explicit and easy to follow.
+            crn     = input("CRN: ").strip()
+            title   = input("Title: ").strip()
+            dept    = input("Department (e.g. BSCO): ").strip().upper()
+            time    = input("Time (e.g. 9:00AM): ").strip()
+            days    = input("Days (e.g. MWF): ").strip().upper()
+            sem     = input("Semester (Fall/Spring): ").strip()
+            year    = input("Year: ").strip()
+            credits = input("Credits: ").strip()
+            cap     = input("Capacity: ").strip()
+            admin.add_course(cursor, (int(crn), title, dept, time, days, sem, int(year), int(credits), int(cap)))
+        elif choice == "3":
+            crn = input("CRN to remove: ").strip()
+            admin.remove_course(cursor, int(crn))
+        elif choice == "4":
+            inst_id = input("Instructor ID: ").strip()
+            crn     = input("CRN: ").strip()
+            admin.add_instructor_to_course(cursor, int(inst_id), int(crn))
+        elif choice == "5":
+            inst_id = input("Instructor ID: ").strip()
+            crn     = input("CRN: ").strip()
+            admin.remove_instructor_from_course(cursor, int(inst_id), int(crn))
+        elif choice == "6":
+            sid = input("Student ID: ").strip()
+            crn = input("CRN: ").strip()
+            admin.add_student_to_course(cursor, int(sid), int(crn))
+        elif choice == "7":
+            sid = input("Student ID: ").strip()
+            crn = input("CRN: ").strip()
+            admin.remove_student_from_course(cursor, int(sid), int(crn))
+        elif choice == "8":
+            crn = input("CRN: ").strip()
+            admin.print_roster(cursor, int(crn))
+        elif choice == "9":
+            # Ask for the role first so we know which fields to collect.
+            role = input("Role (student/instructor/admin): ").strip().lower()
+            uid  = int(input("ID: ").strip())
+            fn   = input("First name: ").strip()
+            ln   = input("Last name: ").strip()
+            if role == "student":
+                grad  = int(input("Grad year: ").strip())
+                major = input("Major (e.g. BSCO): ").strip().upper()
+                email = input("Email: ").strip()
+                admin.add_user(cursor, role, (uid, fn, ln, grad, major, email))
+            elif role == "instructor":
+                title_    = input("Title (e.g. Professor): ").strip()
+                hire_year = int(input("Hire year: ").strip())
+                dept      = input("Department (e.g. BSCO): ").strip().upper()
+                email     = input("Email: ").strip()
+                admin.add_user(cursor, role, (uid, fn, ln, title_, hire_year, dept, email))
+            elif role == "admin":
+                title_  = input("Title (e.g. Registrar): ").strip()
+                office  = input("Office: ").strip()
+                email   = input("Email: ").strip()
+                admin.add_user(cursor, role, (uid, fn, ln, title_, office, email))
+            else:
+                print("  Unknown role.")
+        elif choice == "10":
+            role = input("Role (student/instructor/admin): ").strip().lower()
+            uid  = int(input("ID to remove: ").strip())
+            admin.remove_user(cursor, role, uid)
+        elif choice == "11":
+            print_all(cursor)
+        elif choice == "12":
+            search(cursor)
+        elif choice == "13":
+            update(cursor, database)
+        elif choice == "14":
+            match_courses(cursor)
+        elif choice == "0":
+            logout()
+            break
+        else:
+            print("Invalid choice.")
+
+
 # MAIN MENU
-# Runs setup first then loops the menu until the user exits
+# Runs setup first, requires a successful login, then delegates to the
+# appropriate role-specific menu so each user only sees their own options.
 
 def main():
     database = sqlite3.connect("assignment4.db")
@@ -974,44 +1356,32 @@ def main():
     seed_users_and_courses(cursor, database)
     seed_login_table(cursor, database)
 
-    # Require a successful login before showing the menu at all. If login()
-    # ran out of attempts, it returns (None, None) - in that case we close
-    # the database connection and stop the program right here.
+    # Require a successful login before showing any menu. If login() exhausts
+    # all attempts it returns (None, None) — we close the connection and stop.
     role, user_id = login(cursor)
     if role is None:
         database.close()
         return
 
-    while True:
-        print("University Scheduling System")
-        print("1. Print all")
-        print("2. Search")
-        print("3. Insert")
-        print("4. Update")
-        print("5. Remove")
-        print("6. Match courses to instructors")
-        print("0. Exit")
+    # Load the matching record from the database so we can populate the user
+    # object with their real name, email, etc. rather than leaving them blank.
+    if role == "student":
+        cursor.execute("SELECT * FROM STUDENT WHERE ID = ?", (user_id,))
+        row = cursor.fetchone()
+        user = row_to_student(row)
+        student_menu(user, cursor)
 
-        choice = input("\nChoice: ").strip()
+    elif role == "instructor":
+        cursor.execute("SELECT * FROM INSTRUCTOR WHERE ID = ?", (user_id,))
+        row = cursor.fetchone()
+        user = row_to_instructor(row)
+        instructor_menu(user, cursor)
 
-        if choice == "1":
-            print_all(cursor)
-        elif choice == "2":
-            search(cursor)
-        elif choice == "3":
-            insert(cursor, database)
-        elif choice == "4":
-            update(cursor, database)
-        elif choice == "5":
-            remove(cursor, database)
-        elif choice == "6":
-            match_courses(cursor)
-        elif choice == "0":
-            logout()
-            print("Exiting.")
-            break
-        else:
-            print("Invalid choice.")
+    elif role == "admin":
+        cursor.execute("SELECT * FROM ADMIN WHERE ID = ?", (user_id,))
+        row = cursor.fetchone()
+        user = row_to_admin(row)
+        admin_menu(user, cursor, database)
 
     database.close()
 
