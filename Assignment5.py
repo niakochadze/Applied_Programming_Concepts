@@ -2,6 +2,7 @@
 # Shubaan, Nia, Dillon
 
 import sqlite3
+from getpass import getpass
 
 
 # Shubaan - classes and helper functions
@@ -95,13 +96,13 @@ class Student(User):
             row_to_course(row).print_info()
 
     def add_course(self, cursor, crn):
-        # Step 1: confirm the course exists and retrieve its title and seat limit.
-        cursor.execute("SELECT TITLE, CAPACITY FROM COURSE WHERE CRN = ?", (crn,))
+        # Step 1: confirm the course exists and load it as a Course object.
+        cursor.execute("SELECT * FROM COURSE WHERE CRN = ?", (crn,))
         row = cursor.fetchone()
         if not row:
             print(f"  No course found with CRN {crn}.")
             return
-        title, capacity = row
+        course = row_to_course(row)
 
         # Step 2: prevent double-enrollment by checking ENROLLMENT for this student+CRN pair.
         cursor.execute(
@@ -109,24 +110,42 @@ class Student(User):
             (self.user_id, crn)
         )
         if cursor.fetchone():
-            print(f"  You are already enrolled in {title} (CRN {crn}).")
+            print(f"  You are already enrolled in {course.title} (CRN {crn}).")
             return
 
         # Step 3: enforce the seat cap — count existing enrollments and compare to CAPACITY.
+        # A NULL capacity means the course has no seat limit, so skip the check entirely.
         cursor.execute("SELECT COUNT(*) FROM ENROLLMENT WHERE CRN = ?", (crn,))
         enrolled = cursor.fetchone()[0]
-        if enrolled >= capacity:
-            print(f"  {title} (CRN {crn}) is full ({enrolled}/{capacity} seats taken).")
+        if course.capacity is not None and enrolled >= course.capacity:
+            print(f"  {course.title} (CRN {crn}) is full ({enrolled}/{course.capacity} seats taken).")
             return
 
-        # Step 4: all checks passed — insert the enrollment row and commit to the database.
+        # Step 4: warn (but don't block) if this course's day/time overlaps with
+        # anything already in the student's schedule.
+        cursor.execute("""
+            SELECT C.CRN, C.TITLE, C.DAYS, C.TIME
+            FROM ENROLLMENT E
+            JOIN COURSE C ON E.CRN = C.CRN
+            WHERE E.STUDENT_ID = ?
+        """, (self.user_id,))
+        new_days = days_to_set(course.days)
+        for existing_crn, existing_title, existing_days_str, existing_time in cursor.fetchall():
+            shared_days = new_days & days_to_set(existing_days_str)
+            if shared_days and existing_time == course.time:
+                print(f"  WARNING: {course.title} (CRN {crn}) overlaps with "
+                      f"{existing_title} (CRN {existing_crn}) — both meet at "
+                      f"{course.time} on {'/'.join(sorted(shared_days))}.")
+
+        # Step 5: all checks passed — insert the enrollment row and commit to the database.
         cursor.execute(
             "INSERT INTO ENROLLMENT (STUDENT_ID, CRN) VALUES (?, ?)",
             (self.user_id, crn)
         )
         cursor.connection.commit()
-        print(f"  Enrolled in {title} (CRN {crn}). "
-              f"Seats remaining: {capacity - enrolled - 1}")
+        remaining = (course.capacity - enrolled - 1) if course.capacity is not None else "unlimited"
+        print(f"  Enrolled in {course.title} (CRN {crn}). "
+              f"Seats remaining: {remaining}")
 
     def drop_course(self, cursor, crn):
         # Verify this student is actually enrolled before attempting a delete.
@@ -138,10 +157,10 @@ class Student(User):
             print(f"  You are not enrolled in CRN {crn}.")
             return
 
-        # Fetch the course title so the confirmation message is human-readable.
-        cursor.execute("SELECT TITLE FROM COURSE WHERE CRN = ?", (crn,))
-        title_row = cursor.fetchone()
-        title = title_row[0] if title_row else f"CRN {crn}"
+        # Fetch the course so the confirmation message is human-readable.
+        cursor.execute("SELECT * FROM COURSE WHERE CRN = ?", (crn,))
+        course_row = cursor.fetchone()
+        title = row_to_course(course_row).title if course_row else f"CRN {crn}"
 
         # Remove the enrollment row and persist the change.
         cursor.execute(
@@ -164,13 +183,6 @@ class Student(User):
         if not courses:
             print("  Your schedule is empty — no conflicts possible.")
             return
-
-        def days_to_set(days_str):
-            # "TTH" is stored as a single token, not individual characters, so it must be
-            # handled before the character-split path to avoid {"T","H"} vs {"TU","TH"} mismatch.
-            if days_str.upper() == "TTH":
-                return {"TU", "TH"}              # Tuesday and Thursday as two-char tokens
-            return {c.upper() for c in days_str}  # "MWF" -> {"M", "W", "F"}
 
         # Compare every distinct pair of courses: a conflict is a shared meeting day
         # AND the same start time (the scheduling system uses 1-hour fixed slots).
@@ -325,10 +337,14 @@ class Instructor(User):
             (crn, student_id)
         )
         if cursor.fetchone():
-            # Fetch the name to make the confirmation message more useful.
-            cursor.execute("SELECT NAME, SURNAME FROM STUDENT WHERE ID = ?", (student_id,))
-            name_row = cursor.fetchone()
-            name = f"{name_row[0]} {name_row[1]}" if name_row else f"ID {student_id}"
+            # Fetch the student so the confirmation message is more useful.
+            cursor.execute("SELECT * FROM STUDENT WHERE ID = ?", (student_id,))
+            student_row = cursor.fetchone()
+            if student_row:
+                s = row_to_student(student_row)
+                name = f"{s.first_name} {s.last_name}"
+            else:
+                name = f"ID {student_id}"
             print(f"  {name} (ID {student_id}) IS enrolled in CRN {crn}.")
         else:
             print(f"  Student ID {student_id} is NOT enrolled in CRN {crn}.")
@@ -434,30 +450,30 @@ class Admin(User):
         if not cursor.fetchone():
             print(f"  Student ID {student_id} not found.")
             return
-        cursor.execute("SELECT TITLE, CAPACITY FROM COURSE WHERE CRN = ?", (crn,))
+        cursor.execute("SELECT * FROM COURSE WHERE CRN = ?", (crn,))
         row = cursor.fetchone()
         if not row:
             print(f"  No course found with CRN {crn}.")
             return
-        title, capacity = row
+        course = row_to_course(row)
         # Prevent double-enrollment.
         cursor.execute(
             "SELECT 1 FROM ENROLLMENT WHERE STUDENT_ID = ? AND CRN = ?", (student_id, crn)
         )
         if cursor.fetchone():
-            print(f"  Student {student_id} is already enrolled in {title} (CRN {crn}).")
+            print(f"  Student {student_id} is already enrolled in {course.title} (CRN {crn}).")
             return
-        # Respect the course seat cap.
+        # Respect the course seat cap. A NULL capacity means no seat limit.
         cursor.execute("SELECT COUNT(*) FROM ENROLLMENT WHERE CRN = ?", (crn,))
         enrolled = cursor.fetchone()[0]
-        if enrolled >= capacity:
-            print(f"  {title} (CRN {crn}) is full ({enrolled}/{capacity} seats taken).")
+        if course.capacity is not None and enrolled >= course.capacity:
+            print(f"  {course.title} (CRN {crn}) is full ({enrolled}/{course.capacity} seats taken).")
             return
         cursor.execute(
             "INSERT INTO ENROLLMENT (STUDENT_ID, CRN) VALUES (?, ?)", (student_id, crn)
         )
         cursor.connection.commit()
-        print(f"  Student {student_id} enrolled in {title} (CRN {crn}).")
+        print(f"  Student {student_id} enrolled in {course.title} (CRN {crn}).")
 
     def remove_student_from_course(self, cursor, student_id, crn):
         # Confirm the enrollment row exists before deleting it.
@@ -562,7 +578,6 @@ class Course:
         self.year = 0
         self.credits = 0
         self.capacity = 0
-        self.enrolled = []
 
     def set_crn(self, crn):
         self.crn = crn
@@ -590,21 +605,6 @@ class Course:
 
     def set_capacity(self, capacity):
         self.capacity = capacity
-
-    def is_full(self):
-        return len(self.enrolled) >= self.capacity
-
-    def enroll(self, student_id):
-        if not self.is_full() and student_id not in self.enrolled:
-            self.enrolled.append(student_id)
-            return True
-        return False
-
-    def drop(self, student_id):
-        if student_id in self.enrolled:
-            self.enrolled.remove(student_id)
-            return True
-        return False
 
     def print_info(self):
         print(f"[Course] CRN: {self.crn} | {self.title} | Dept: {self.department} | {self.days} {self.time} | {self.semester} {self.year} | {self.credits} credits | Capacity: {self.capacity}")
@@ -637,6 +637,14 @@ def row_to_course(row):
     c.set_time(row[3]); c.set_days(row[4]); c.set_semester(row[5])
     c.set_year(row[6]); c.set_credits(row[7]); c.set_capacity(row[8])
     return c
+
+
+def days_to_set(days_str):
+    # "TTH" is stored as a single token, not individual characters, so it must be
+    # handled before the character-split path to avoid {"T","H"} vs {"TU","TH"} mismatch.
+    if days_str.upper() == "TTH":
+        return {"TU", "TH"}              # Tuesday and Thursday as two-char tokens
+    return {c.upper() for c in days_str}  # "MWF" -> {"M", "W", "F"}
 
 
 # Nia - database setup and operations
@@ -926,7 +934,7 @@ def login(cursor):
 
     for attempt in range(max_attempts):
         email = input("Email: ").strip()
-        password = input("Password: ").strip()
+        password = getpass("Password: ").strip()
 
         user_id = None
         role = None
@@ -1038,47 +1046,6 @@ def search(cursor):
             print("No courses found in that department.")
 
 
-# INSERT
-# Insert a new student or course into the database
-
-def insert(cursor, database):
-    print("\nInsert:")
-    print("1. Student")
-    print("2. Course")
-    choice = input("Choice: ").strip()
-
-    if choice == "1":
-        uid = input("ID: ").strip()
-        fname = input("First name: ").strip()
-        lname = input("Last name: ").strip()
-        grad = input("Grad year: ").strip()
-        major = input("Major: ").strip()
-        email = input("Email: ").strip()
-        try:
-            cursor.execute("INSERT INTO STUDENT VALUES (?, ?, ?, ?, ?, ?)", (uid, fname, lname, grad, major, email))
-            database.commit()
-            print("Student added.")
-        except sqlite3.IntegrityError:
-            print("ID already exists.")
-
-    elif choice == "2":
-        crn = input("CRN: ").strip()
-        title = input("Title: ").strip()
-        dept = input("Department: ").strip().upper()
-        time = input("Time: ").strip()
-        days = input("Days (e.g. MWF): ").strip()
-        sem = input("Semester: ").strip()
-        year = input("Year: ").strip()
-        credits = input("Credits: ").strip()
-        capacity = input("Capacity: ").strip()
-        try:
-            cursor.execute("INSERT INTO COURSE VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", (crn, title, dept, time, days, sem, year, credits, capacity))
-            database.commit()
-            print("Course added.")
-        except sqlite3.IntegrityError:
-            print("CRN already exists.")
-
-
 # UPDATE
 # Update a student email, instructor title, or admin title
 
@@ -1109,35 +1076,6 @@ def update(cursor, database):
         cursor.execute("UPDATE ADMIN SET TITLE = ? WHERE ID = ?", (title, uid))
         database.commit()
         print("Admin updated.")
-
-
-# REMOVE
-# Remove a student, instructor, or course from the database
-
-def remove(cursor, database):
-    print("\nRemove:")
-    print("1. Student by ID")
-    print("2. Instructor by ID")
-    print("3. Course by CRN")
-    choice = input("Choice: ").strip()
-
-    if choice == "1":
-        uid = input("Student ID: ").strip()
-        cursor.execute("DELETE FROM STUDENT WHERE ID = ?", (uid,))
-        database.commit()
-        print("Student removed.")
-
-    elif choice == "2":
-        uid = input("Instructor ID: ").strip()
-        cursor.execute("DELETE FROM INSTRUCTOR WHERE ID = ?", (uid,))
-        database.commit()
-        print("Instructor removed.")
-
-    elif choice == "3":
-        crn = input("Course CRN: ").strip()
-        cursor.execute("DELETE FROM COURSE WHERE CRN = ?", (crn,))
-        database.commit()
-        print("Course removed.")
 
 
 # MATCH COURSES TO INSTRUCTORS
@@ -1194,10 +1132,16 @@ def student_menu(student, cursor):
             student.print_schedule(cursor)
         elif choice == "4":
             crn = input("CRN to add: ").strip()
-            student.add_course(cursor, int(crn))
+            try:
+                student.add_course(cursor, int(crn))
+            except ValueError:
+                print("Invalid input, please enter a number.")
         elif choice == "5":
             crn = input("CRN to drop: ").strip()
-            student.drop_course(cursor, int(crn))
+            try:
+                student.drop_course(cursor, int(crn))
+            except ValueError:
+                print("Invalid input, please enter a number.")
         elif choice == "6":
             student.check_conflicts(cursor)
         elif choice == "0":
@@ -1229,11 +1173,17 @@ def instructor_menu(instructor, cursor):
             instructor.print_schedule(cursor)
         elif choice == "4":
             crn = input("CRN: ").strip()
-            instructor.print_class_list(cursor, int(crn))
+            try:
+                instructor.print_class_list(cursor, int(crn))
+            except ValueError:
+                print("Invalid input, please enter a number.")
         elif choice == "5":
             crn = input("CRN: ").strip()
             sid = input("Student ID: ").strip()
-            instructor.search_roster(cursor, int(crn), int(sid))
+            try:
+                instructor.search_roster(cursor, int(crn), int(sid))
+            except ValueError:
+                print("Invalid input, please enter a number.")
         elif choice == "0":
             logout()
             break
@@ -1278,57 +1228,84 @@ def admin_menu(admin, cursor, database):
             year    = input("Year: ").strip()
             credits = input("Credits: ").strip()
             cap     = input("Capacity: ").strip()
-            admin.add_course(cursor, (int(crn), title, dept, time, days, sem, int(year), int(credits), int(cap)))
+            try:
+                admin.add_course(cursor, (int(crn), title, dept, time, days, sem, int(year), int(credits), int(cap)))
+            except ValueError:
+                print("Invalid input, please enter a number.")
         elif choice == "3":
             crn = input("CRN to remove: ").strip()
-            admin.remove_course(cursor, int(crn))
+            try:
+                admin.remove_course(cursor, int(crn))
+            except ValueError:
+                print("Invalid input, please enter a number.")
         elif choice == "4":
             inst_id = input("Instructor ID: ").strip()
             crn     = input("CRN: ").strip()
-            admin.add_instructor_to_course(cursor, int(inst_id), int(crn))
+            try:
+                admin.add_instructor_to_course(cursor, int(inst_id), int(crn))
+            except ValueError:
+                print("Invalid input, please enter a number.")
         elif choice == "5":
             inst_id = input("Instructor ID: ").strip()
             crn     = input("CRN: ").strip()
-            admin.remove_instructor_from_course(cursor, int(inst_id), int(crn))
+            try:
+                admin.remove_instructor_from_course(cursor, int(inst_id), int(crn))
+            except ValueError:
+                print("Invalid input, please enter a number.")
         elif choice == "6":
             sid = input("Student ID: ").strip()
             crn = input("CRN: ").strip()
-            admin.add_student_to_course(cursor, int(sid), int(crn))
+            try:
+                admin.add_student_to_course(cursor, int(sid), int(crn))
+            except ValueError:
+                print("Invalid input, please enter a number.")
         elif choice == "7":
             sid = input("Student ID: ").strip()
             crn = input("CRN: ").strip()
-            admin.remove_student_from_course(cursor, int(sid), int(crn))
+            try:
+                admin.remove_student_from_course(cursor, int(sid), int(crn))
+            except ValueError:
+                print("Invalid input, please enter a number.")
         elif choice == "8":
             crn = input("CRN: ").strip()
-            admin.print_roster(cursor, int(crn))
+            try:
+                admin.print_roster(cursor, int(crn))
+            except ValueError:
+                print("Invalid input, please enter a number.")
         elif choice == "9":
             # Ask for the role first so we know which fields to collect.
-            role = input("Role (student/instructor/admin): ").strip().lower()
-            uid  = int(input("ID: ").strip())
-            fn   = input("First name: ").strip()
-            ln   = input("Last name: ").strip()
-            if role == "student":
-                grad  = int(input("Grad year: ").strip())
-                major = input("Major (e.g. BSCO): ").strip().upper()
-                email = input("Email: ").strip()
-                admin.add_user(cursor, role, (uid, fn, ln, grad, major, email))
-            elif role == "instructor":
-                title_    = input("Title (e.g. Professor): ").strip()
-                hire_year = int(input("Hire year: ").strip())
-                dept      = input("Department (e.g. BSCO): ").strip().upper()
-                email     = input("Email: ").strip()
-                admin.add_user(cursor, role, (uid, fn, ln, title_, hire_year, dept, email))
-            elif role == "admin":
-                title_  = input("Title (e.g. Registrar): ").strip()
-                office  = input("Office: ").strip()
-                email   = input("Email: ").strip()
-                admin.add_user(cursor, role, (uid, fn, ln, title_, office, email))
-            else:
-                print("  Unknown role.")
+            try:
+                role = input("Role (student/instructor/admin): ").strip().lower()
+                uid  = int(input("ID: ").strip())
+                fn   = input("First name: ").strip()
+                ln   = input("Last name: ").strip()
+                if role == "student":
+                    grad  = int(input("Grad year: ").strip())
+                    major = input("Major (e.g. BSCO): ").strip().upper()
+                    email = input("Email: ").strip()
+                    admin.add_user(cursor, role, (uid, fn, ln, grad, major, email))
+                elif role == "instructor":
+                    title_    = input("Title (e.g. Professor): ").strip()
+                    hire_year = int(input("Hire year: ").strip())
+                    dept      = input("Department (e.g. BSCO): ").strip().upper()
+                    email     = input("Email: ").strip()
+                    admin.add_user(cursor, role, (uid, fn, ln, title_, hire_year, dept, email))
+                elif role == "admin":
+                    title_  = input("Title (e.g. Registrar): ").strip()
+                    office  = input("Office: ").strip()
+                    email   = input("Email: ").strip()
+                    admin.add_user(cursor, role, (uid, fn, ln, title_, office, email))
+                else:
+                    print("  Unknown role.")
+            except ValueError:
+                print("Invalid input, please enter a number.")
         elif choice == "10":
             role = input("Role (student/instructor/admin): ").strip().lower()
-            uid  = int(input("ID to remove: ").strip())
-            admin.remove_user(cursor, role, uid)
+            try:
+                uid = int(input("ID to remove: ").strip())
+                admin.remove_user(cursor, role, uid)
+            except ValueError:
+                print("Invalid input, please enter a number.")
         elif choice == "11":
             print_all(cursor)
         elif choice == "12":

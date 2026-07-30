@@ -187,8 +187,11 @@ class TestLoginLogout(BaseTestCase):
 
     # Typical: valid student login
     def test_login_typical_student(self):
-        fake_inputs = ["omartinez@university.edu", "omartinez"]
-        with patch("builtins.input", side_effect=fake_inputs):
+        # Password is now masked via getpass(), which reads the raw stdin
+        # stream instead of going through builtins.input() - so it needs
+        # its own patch separate from the email input() patch.
+        with patch("builtins.input", side_effect=["omartinez@university.edu"]), \
+             patch("Assignment5.getpass", return_value="omartinez"):
             with redirect_stdout(io.StringIO()):
                 role, user_id = a5.login(self.cursor)
         self.assertEqual(role, "student")
@@ -196,8 +199,8 @@ class TestLoginLogout(BaseTestCase):
 
     # Typical: valid admin login
     def test_login_typical_admin(self):
-        fake_inputs = ["pnolan@university.edu", "pnolan"]
-        with patch("builtins.input", side_effect=fake_inputs):
+        with patch("builtins.input", side_effect=["pnolan@university.edu"]), \
+             patch("Assignment5.getpass", return_value="pnolan"):
             with redirect_stdout(io.StringIO()):
                 role, user_id = a5.login(self.cursor)
         self.assertEqual(role, "admin")
@@ -205,8 +208,8 @@ class TestLoginLogout(BaseTestCase):
 
     # Typical: valid instructor login
     def test_login_typical_instructor(self):
-        fake_inputs = ["rhayes@university.edu", "rhayes"]
-        with patch("builtins.input", side_effect=fake_inputs):
+        with patch("builtins.input", side_effect=["rhayes@university.edu"]), \
+             patch("Assignment5.getpass", return_value="rhayes"):
             with redirect_stdout(io.StringIO()):
                 role, user_id = a5.login(self.cursor)
         self.assertEqual(role, "instructor")
@@ -214,12 +217,10 @@ class TestLoginLogout(BaseTestCase):
 
     # Unlikely: wrong password 3 times
     def test_login_wrong_password_three_times(self):
-        fake_inputs = [
-            "omartinez@university.edu", "wrong1",
-            "omartinez@university.edu", "wrong2",
-            "omartinez@university.edu", "wrong3",
-        ]
-        with patch("builtins.input", side_effect=fake_inputs):
+        fake_emails = ["omartinez@university.edu"] * 3
+        fake_passwords = ["wrong1", "wrong2", "wrong3"]
+        with patch("builtins.input", side_effect=fake_emails), \
+             patch("Assignment5.getpass", side_effect=fake_passwords):
             with redirect_stdout(io.StringIO()):
                 role, user_id = a5.login(self.cursor)
         self.assertIsNone(role)
@@ -227,12 +228,10 @@ class TestLoginLogout(BaseTestCase):
 
     # Unlikely: email that belongs to nobody
     def test_login_unknown_email(self):
-        fake_inputs = [
-            "ghost@university.edu", "ghost",
-            "ghost@university.edu", "ghost",
-            "ghost@university.edu", "ghost",
-        ]
-        with patch("builtins.input", side_effect=fake_inputs):
+        fake_emails = ["ghost@university.edu"] * 3
+        fake_passwords = ["ghost"] * 3
+        with patch("builtins.input", side_effect=fake_emails), \
+             patch("Assignment5.getpass", side_effect=fake_passwords):
             with redirect_stdout(io.StringIO()):
                 role, user_id = a5.login(self.cursor)
         self.assertIsNone(role)
